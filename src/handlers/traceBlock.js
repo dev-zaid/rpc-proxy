@@ -98,8 +98,9 @@ async function handleTraceBlock(payload) {
 
     const result = rows.map((row) => {
       const traceAddress = parseTraceAddress(row.trace_address);
-      const callType = row.call_type || "call";
-      const isCreate = callType === "create" || callType === "create2";
+      const rawCallType = row.call_type || "call";
+      const callType = rawCallType === "create2" ? "create" : rawCallType;
+      const isCreate = callType === "create";
       const fromAddress = normalizeAddress(row.from_address_hash);
       const toAddress = normalizeAddress(row.to_address_hash);
       const action = {
