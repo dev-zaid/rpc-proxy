@@ -198,6 +198,7 @@ function formatTraceRow(row) {
   const rawCallType = row.call_type || "call";
   const callType = rawCallType === "create2" ? "create" : rawCallType;
   const isCreate = callType === "create";
+  const actionType = isCreate ? "create" : "call";
   const fromAddress = normalizeAddress(row.from_address_hash);
   const toAddress = normalizeAddress(row.to_address_hash);
   const action = {
@@ -226,7 +227,7 @@ function formatTraceRow(row) {
     traceAddress,
     transactionHash: normalizeHex(row.transaction_hash, { empty: "0x" }),
     transactionPosition: row.transaction_position,
-    type: callType
+    type: actionType
   };
 
   if (isCreate && toAddress) {
