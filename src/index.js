@@ -7,7 +7,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
 const pool = require("./db/pool");
-const { handleTraceBlock } = require("./handlers/traceBlock");
+const { handleTraceBlock, handleTraceTransaction } = require("./handlers/traceBlock");
 const { proxyJson, proxyStream } = require("./handlers/proxy");
 const { jsonRpcError } = require("./utils/formatters");
 
@@ -72,6 +72,10 @@ app.post("/", async (req, res) => {
       const response = await handleTraceBlock(payload);
       return res.json(response);
     }
+    if (payload.method === "trace_transaction") {
+      const response = await handleTraceTransaction(payload);
+      return res.json(response);
+    }
 
     return proxyStream(payload, REQUEST_TIMEOUT_MS, res);
   }
@@ -85,6 +89,10 @@ app.post("/", async (req, res) => {
 
     if (entry.method === "trace_block") {
       responses.push(await handleTraceBlock(entry));
+      continue;
+    }
+    if (entry.method === "trace_transaction") {
+      responses.push(await handleTraceTransaction(entry));
       continue;
     }
 

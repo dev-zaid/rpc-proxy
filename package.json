@@ -12,7 +12,8 @@
     "pm2:restart": "pm2 restart rpc-proxy",
     "pm2:delete": "pm2 delete rpc-proxy",
     "pm2:logs": "pm2 logs rpc-proxy",
-    "pm2:status": "pm2 status"
+    "pm2:status": "pm2 status",
+    "smoke:trace-empty": "node scripts/smoke-trace-empty.js"
   },
   "engines": {
     "node": ">=18"
