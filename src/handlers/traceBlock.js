@@ -39,6 +39,19 @@ WHERE number = $1
 LIMIT 1;
 `;
 
+const BLOCK_TX_COUNT_SQL = `
+SELECT COUNT(*)::int AS tx_count
+FROM transactions
+WHERE block_number = $1;
+`;
+
+const BLOCK_TRACED_TX_COUNT_SQL = `
+SELECT COUNT(DISTINCT it.transaction_hash)::int AS traced_tx_count
+FROM internal_transactions it
+JOIN transactions t ON it.transaction_hash = t.hash
+WHERE t.block_number = $1;
+`;
+
 let traceSqlPromise;
 let hashColumnIsByteaPromise;
 
@@ -130,6 +143,20 @@ function getUpstreamUrl() {
   return process.env.EVMOS_RPC_URL || "http://18.60.158.87:8545";
 }
 
+function getTraceReadyMode() {
+  const mode = String(process.env.TRACE_READY_MODE || "").toLowerCase();
+  if (mode === "counts" || mode === "per_block") return "counts";
+  if (mode === "height") return "height";
+  const hasHeightGuard = Boolean(
+    process.env.TRACE_READY_HEIGHT || process.env.TRACE_READY_LAG
+  );
+  return hasHeightGuard ? "height" : "none";
+}
+
+function traceReadyDebugEnabled() {
+  return String(process.env.TRACE_READY_DEBUG || "false").toLowerCase() === "true";
+}
+
 async function getUpstreamBlock(blockNumberHex) {
   const controller = new AbortController();
   const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
@@ -150,7 +177,37 @@ async function getUpstreamBlock(blockNumberHex) {
     });
 
     const data = await response.json().catch(() => null);
-    return data?.result ?? null;
+    if (data === null) return null;
+    return { ok: true, result: data?.result ?? null };
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function getUpstreamBlockNumber() {
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  timeoutId.unref();
+
+  try {
+    const response = await fetch(getUpstreamUrl(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_blockNumber",
+        params: []
+      }),
+      signal: controller.signal
+    });
+
+    const data = await response.json().catch(() => null);
+    if (!data?.result) return null;
+    return Number(BigInt(data.result));
   } catch (err) {
     return null;
   } finally {
@@ -161,10 +218,10 @@ async function getUpstreamBlock(blockNumberHex) {
 async function blockExistsOnChain(blockNumberHex) {
   const block = await getUpstreamBlock(blockNumberHex);
   if (block === null) return null;
-  return Boolean(block);
+  return Boolean(block.result);
 }
 
-async function transactionExistsOnChain(txHash) {
+async function getUpstreamTransaction(txHash) {
   const controller = new AbortController();
   const timeoutMs = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -185,12 +242,105 @@ async function transactionExistsOnChain(txHash) {
 
     const data = await response.json().catch(() => null);
     if (data === null) return null;
-    return Boolean(data?.result);
+    return { ok: true, result: data?.result ?? null };
   } catch (err) {
     return null;
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function getTraceReadyHeight() {
+  const explicitHeight = process.env.TRACE_READY_HEIGHT;
+  if (explicitHeight && /^\d+$/.test(explicitHeight)) {
+    return Number(explicitHeight);
+  }
+
+  const lagValue = process.env.TRACE_READY_LAG;
+  if (lagValue && /^\d+$/.test(lagValue)) {
+    const head = await getUpstreamBlockNumber();
+    if (head === null) return null;
+    return Math.max(head - Number(lagValue), 0);
+  }
+
+  return null;
+}
+
+async function ensureTraceReady(blockNumber) {
+  const readyHeight = await getTraceReadyHeight();
+  if (readyHeight === null || readyHeight === undefined) return { ready: true };
+  if (blockNumber <= readyHeight) return { ready: true };
+  return { ready: false, readyHeight };
+}
+
+async function ensureTraceReadyByCounts(blockNumberParam) {
+  const txRes = await pool.query(BLOCK_TX_COUNT_SQL, [blockNumberParam]);
+  const txCount = Number(txRes.rows[0]?.tx_count ?? 0);
+  if (txCount === 0) return { ready: true, reason: "empty_block" };
+
+  const tracedRes = await pool.query(BLOCK_TRACED_TX_COUNT_SQL, [blockNumberParam]);
+  const tracedCount = Number(tracedRes.rows[0]?.traced_tx_count ?? 0);
+  if (tracedCount >= txCount) return { ready: true };
+  return { ready: false, reason: "traces_pending" };
+}
+
+async function ensureTraceReadyForTransaction(txHashParam) {
+  const res = await pool.query(
+    "SELECT 1 FROM internal_transactions WHERE transaction_hash = $1 LIMIT 1;",
+    [txHashParam]
+  );
+  return { ready: res.rowCount > 0 };
+}
+
+function traceNotReadyError(id, readyHeight, dataOverride) {
+  const data = dataOverride ?? (readyHeight !== undefined ? { traceReadyHeight: readyHeight } : undefined);
+  return jsonRpcError(id, -32010, "Trace data not ready", data);
+}
+
+async function ensureTraceReadyByCountsWithUpstream(blockNumberParam, blockNumberHex) {
+  const readiness = await ensureTraceReadyByCounts(blockNumberParam);
+  if (!readiness.ready) return readiness;
+
+  if (readiness.reason === "empty_block") {
+    const upstream = await getUpstreamBlock(blockNumberHex);
+    if (upstream?.ok && upstream.result) {
+      const upstreamTxCount = Array.isArray(upstream.result.transactions)
+        ? upstream.result.transactions.length
+        : 0;
+      if (upstreamTxCount > 0) {
+        return {
+          ready: false,
+          reason: "db_missing_transactions",
+          upstreamTxCount
+        };
+      }
+    }
+  }
+
+  return readiness;
+}
+
+async function checkTraceReadinessForBlock({ id, blockNumberParam, blockNumber }) {
+  const mode = getTraceReadyMode();
+  if (mode === "counts") {
+    const blockNumberHex = `0x${BigInt(blockNumber).toString(16)}`;
+    const readiness = await ensureTraceReadyByCountsWithUpstream(blockNumberParam, blockNumberHex);
+    if (!readiness.ready) {
+      if (traceReadyDebugEnabled()) {
+        console.log(
+          `[${new Date().toISOString()}] trace_ready counts not ready`,
+          { blockNumber, ...readiness }
+        );
+      }
+      return traceNotReadyError(id, undefined, readiness);
+    }
+    return null;
+  }
+  if (mode === "height") {
+    const readiness = await ensureTraceReady(blockNumber);
+    if (!readiness.ready) return traceNotReadyError(id, readiness.readyHeight);
+  }
+  return null;
 }
 
 function formatTraceRow(row) {
@@ -249,6 +399,7 @@ async function handleTraceBlock(payload) {
   const blockNumberBigInt = BigInt(params[0]);
   const blockNumberParam = blockNumberBigInt.toString(10);
   const blockNumberHex = `0x${blockNumberBigInt.toString(16)}`;
+  const blockNumber = Number(blockNumberBigInt);
   const QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 15000);
 
   try {
@@ -274,20 +425,28 @@ async function handleTraceBlock(payload) {
         if (blocksTable.rowCount > 0) {
           const blockExists = await pool.query(BLOCK_EXISTS_IN_BLOCKS_SQL, [blockNumberParam]);
           if (blockExists.rowCount > 0) {
+            const notReady = await checkTraceReadinessForBlock({ id, blockNumberParam, blockNumber });
+            if (notReady) return notReady;
             return { jsonrpc: "2.0", id, result: [] };
           }
           const upstreamExists = await blockExistsOnChain(blockNumberHex);
           if (upstreamExists === null || upstreamExists) {
+            const notReady = await checkTraceReadinessForBlock({ id, blockNumberParam, blockNumber });
+            if (notReady) return notReady;
             return { jsonrpc: "2.0", id, result: [] };
           }
           return jsonRpcError(id, -32001, "Block not found");
         }
         const upstreamExists = await blockExistsOnChain(blockNumberHex);
         if (upstreamExists === null || upstreamExists) {
+          const notReady = await checkTraceReadinessForBlock({ id, blockNumberParam, blockNumber });
+          if (notReady) return notReady;
           return { jsonrpc: "2.0", id, result: [] };
         }
         return jsonRpcError(id, -32001, "Block not found");
       }
+      const notReady = await checkTraceReadinessForBlock({ id, blockNumberParam, blockNumber });
+      if (notReady) return notReady;
       return { jsonrpc: "2.0", id, result: [] };
     }
 
@@ -329,13 +488,47 @@ async function handleTraceTransaction(payload) {
     clearTimeout(timeoutId);
 
     if (rows.length === 0) {
-      const exists = await pool.query("SELECT 1 FROM transactions WHERE hash = $1 LIMIT 1;", [txHashParam]);
-      if (exists.rowCount === 0) {
-        const upstreamExists = await transactionExistsOnChain(txHash);
-        if (upstreamExists === null || upstreamExists) {
+      const txRow = await pool.query(
+        "SELECT block_number FROM transactions WHERE hash = $1 LIMIT 1;",
+        [txHashParam]
+      );
+      const exists = txRow.rowCount > 0;
+      if (!exists) {
+        const upstream = await getUpstreamTransaction(txHash);
+        if (upstream === null) {
           return { jsonrpc: "2.0", id, result: [] };
         }
-        return jsonRpcError(id, -32001, "Transaction not found");
+        if (upstream.result === null) {
+          return jsonRpcError(id, -32001, "Transaction not found");
+        }
+        if (getTraceReadyMode() === "counts" && upstream.result?.blockNumber) {
+          return traceNotReadyError(id, undefined, { reason: "db_missing_transaction" });
+        }
+        if (upstream.result.blockNumber) {
+          const blockNumber = Number(BigInt(upstream.result.blockNumber));
+          const notReady = await checkTraceReadinessForBlock({
+            id,
+            blockNumberParam: blockNumber.toString(10),
+            blockNumber
+          });
+          if (notReady) return notReady;
+        }
+        return { jsonrpc: "2.0", id, result: [] };
+      }
+      if (exists) {
+        const blockNumber = Number(txRow.rows[0].block_number);
+        const mode = getTraceReadyMode();
+        if (mode === "counts") {
+          const readyTx = await ensureTraceReadyForTransaction(txHashParam);
+          if (!readyTx.ready) return traceNotReadyError(id);
+        } else {
+          const notReady = await checkTraceReadinessForBlock({
+            id,
+            blockNumberParam: blockNumber.toString(10),
+            blockNumber
+          });
+          if (notReady) return notReady;
+        }
       }
       return { jsonrpc: "2.0", id, result: [] };
     }

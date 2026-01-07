@@ -13,7 +13,8 @@
     "pm2:delete": "pm2 delete rpc-proxy",
     "pm2:logs": "pm2 logs rpc-proxy",
     "pm2:status": "pm2 status",
-    "smoke:trace-empty": "node scripts/smoke-trace-empty.js"
+    "smoke:trace-empty": "node scripts/smoke-trace-empty.js",
+    "smoke:trace-guard": "node scripts/smoke-trace-guard.js"
   },
   "engines": {
     "node": ">=18"
